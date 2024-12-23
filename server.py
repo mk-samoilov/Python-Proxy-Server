@@ -2,11 +2,21 @@ import socket
 import sys
 import logging
 import threading
+from itertools import cycle
 
 from config import *
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+def xor_encrypt_decrypt(data, key):
+    return bytes(a ^ b for a, b in zip(data, cycle(key)))
+
+def split_head_body(data):
+    split = data.split(b'\r\n\r\n', 1)
+    if len(split) == 2:
+        return split[0] + b'\r\n\r\n', split[1]
+    return data, b''
 
 class ProxyServer:
     def __init__(self, host="0.0.0.0", port=8888):
@@ -38,14 +48,16 @@ class ProxyServer:
 
     def handle_client_request(self, client_socket, data):
         try:
-            lines = data.split(b'\r\n')
+            head, body = split_head_body(data)
+            lines = head.split(b'\r\n')
             first_line = lines[0]
             method, url, _ = first_line.split(b' ', 2)
 
             if method == b"CONNECT":
                 self.handle_connect(client_socket, url)
             else:
-                self.handle_http(client_socket, data, url)
+                encrypted_body = xor_encrypt_decrypt(body, ENCRYPTION_KEY) if body else b''
+                self.handle_http(client_socket, head + encrypted_body, url)
 
         except Exception as e:
             logger.error(f"Error from handling request: {e}")
@@ -62,12 +74,16 @@ class ProxyServer:
             server_socket.connect((webserver, port))
             client_socket.send(b"HTTP/1.1 200 Connection established\r\n\r\n")
 
-            def forward(source, destination):
+            def forward(source, destination, encrypt=False):
                 while True:
                     try:
                         data = source.recv(BUFFER_SIZE)
                         if not data:
                             break
+                        if encrypt:
+                            head, body = split_head_body(data)
+                            encrypted_body = xor_encrypt_decrypt(body, ENCRYPTION_KEY) if body else b''
+                            data = head + encrypted_body
                         destination.sendall(data)
                     except:
                         break
@@ -75,7 +91,7 @@ class ProxyServer:
                 destination.close()
 
             threading.Thread(target=forward, args=(client_socket, server_socket), daemon=True).start()
-            threading.Thread(target=forward, args=(server_socket, client_socket), daemon=True).start()
+            threading.Thread(target=forward, args=(server_socket, client_socket, True), daemon=True).start()
 
         except Exception as e:
             logger.error(f"Error from establishing CONNECT tunnel: {e}")
@@ -112,7 +128,9 @@ class ProxyServer:
                         response = proxy_socket.recv(BUFFER_SIZE)
                         if not response:
                             break
-                        client_socket.send(response)
+                        head, body = split_head_body(response)
+                        encrypted_body = xor_encrypt_decrypt(body, ENCRYPTION_KEY) if body else b''
+                        client_socket.send(head + encrypted_body)
                     except:
                         break
                 self.close_connection(proxy_socket)
@@ -131,9 +149,9 @@ class ProxyServer:
         except:
             pass
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
-        proxy = ProxyServer('0.0.0.0', 8888)
+        proxy = ProxyServer("0.0.0.0", 8888)
         proxy.run()
     except KeyboardInterrupt:
         logger.info("Server stopped.")
